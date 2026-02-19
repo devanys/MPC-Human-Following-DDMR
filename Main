@@ -1,0 +1,478 @@
+import pybullet as p
+import pybullet_data
+import time
+import numpy as np
+import math
+import random
+import tkinter as tk
+import threading
+
+try:
+    from casadi import *
+    CASADI_AVAILABLE = True
+except ImportError:
+    CASADI_AVAILABLE = False
+
+DT             = 0.05
+SIM_TIME       = 100000
+WHEEL_RADIUS   = 0.033
+HALF_WHEELBASE = 0.16
+V_MAX          = 0.5
+V_MIN          = 0.0
+W_MAX          = 1.5
+W_MIN          = -1.5
+N_HORIZON      = 10
+Q_WEIGHT       = 15.0
+R_WEIGHT       = 0.5
+SAFE_DISTANCE  = 0.8
+ARENA_SIZE     = 4.0
+HUMAN_SPEED    = 0.4
+
+ROBOT_PATH = "C:/Users/Devan/Downloads/pybullet_robots-master/pybullet_robots-master/data/turtlebot.urdf"
+
+gui_data = {
+    'robot_x': 0.0, 'robot_y': 0.0, 'robot_theta': 0.0,
+    'human_x': 0.0, 'human_y': 0.0,
+    'distance': 0.0, 'bearing_error': 0.0, 'pos_error': 0.0,
+    'linear_v': 0.0, 'angular_w': 0.0,
+    'step': 0,
+    'mpc_mode': 'CasADi MPC' if CASADI_AVAILABLE else 'Fallback PD-MPC',
+    'safe_distance': SAFE_DISTANCE,
+    'v_max': V_MAX, 'w_max': W_MAX,
+    'q_weight': Q_WEIGHT, 'r_weight': R_WEIGHT,
+    'human_speed': HUMAN_SPEED,
+    'sim_speed': 1.0,
+    'reset_signal': False, 'paused': False,
+}
+
+def pose_estimation(robot_pos, robot_orn, human_pos):
+    rx, ry, _ = robot_pos
+    hx, hy, _ = human_pos
+    yaw = p.getEulerFromQuaternion(robot_orn)[2]
+    dx, dy = hx - rx, hy - ry
+    distance = math.hypot(dx, dy)
+    angle_to_human = math.atan2(dy, dx)
+    bearing_error = math.atan2(math.sin(angle_to_human - yaw), math.cos(angle_to_human - yaw))
+    safe_d = gui_data['safe_distance']
+    tx = hx - safe_d * math.cos(angle_to_human)
+    ty = hy - safe_d * math.sin(angle_to_human)
+    return distance, bearing_error, [tx, ty, angle_to_human]
+
+class MPCController:
+    def __init__(self):
+        self.N    = N_HORIZON
+        self.dt   = DT
+        self.n_x  = 3
+        self.n_u  = 2
+        self.u_prev = [0.0, 0.0]
+        self._build_solver()
+
+    def _build_solver(self):
+        # --- Simbolik variabel ---
+        x, y, th = SX.sym('x'), SX.sym('y'), SX.sym('th')
+        v, om    = SX.sym('v'), SX.sym('om')
+        st = vertcat(x, y, th)
+        ct = vertcat(v, om)
+
+        # --- Model kinematik DDMR ---
+        f = Function('f', [st, ct], [vertcat(
+            x  + v * cos(th) * self.dt,
+            y  + v * sin(th) * self.dt,
+            th + om * self.dt
+        )])
+
+        # --- Decision variables ---
+        X = SX.sym('X', self.n_x, self.N + 1)
+        U = SX.sym('U', self.n_u, self.N)
+
+        # --- Parameter: [Q, R, state_awal(3), ref_state(3)] ---
+        P = SX.sym('P', 2 + self.n_x + self.n_x)
+
+        Q_sym = P[0]
+        R_sym = P[1]
+        x0_p  = P[2:5]
+        xref  = P[5:8]
+
+        cost = 0
+        g    = []
+
+        # Constraint: state awal harus sama dengan state robot sekarang
+        g.append(X[:, 0] - x0_p)
+
+        for i in range(self.N):
+            e     = X[:, i] - xref
+            cost += Q_sym * (e[0]**2 + e[1]**2 + 0.3 * e[2]**2)
+            if i > 0:
+                du = U[:, i] - U[:, i-1]
+            else:
+                du = U[:, i]
+            cost += R_sym * (du[0]**2 + du[1]**2)
+            g.append(X[:, i+1] - f(X[:, i], U[:, i]))
+
+        # Terminal cost
+        e_t   = X[:, self.N] - xref
+        cost += Q_sym * (e_t[0]**2 + e_t[1]**2)
+
+        opt_vars = vertcat(reshape(X, -1, 1), reshape(U, -1, 1))
+        nlp = {'x': opt_vars, 'f': cost, 'g': vertcat(*g), 'p': P}
+
+        # Constraints bounds
+        # g[0]: state awal (3 equality) + model (n_x * N equality)
+        n_eq = self.n_x + self.n_x * self.N
+        self.lbg = [0.0] * n_eq
+        self.ubg = [0.0] * n_eq
+
+        # Variable bounds
+        lbx = [-1e9] * (self.n_x * (self.N + 1))
+        ubx = [ 1e9] * (self.n_x * (self.N + 1))
+        for _ in range(self.N):
+            lbx += [0.0,  W_MIN]
+            ubx += [V_MAX, W_MAX]
+        self.lbx = lbx
+        self.ubx = ubx
+
+        opts = {
+            'ipopt.print_level' : 0,
+            'ipopt.max_iter'    : 200,
+            'ipopt.tol'         : 1e-4,
+            'print_time'        : 0
+        }
+        self.solver = nlpsol('solver', 'ipopt', nlp, opts)
+        print("[MPC] CasADi solver siap")
+
+    def solve(self, state_now, ref_state):
+        Q_ = gui_data['q_weight']
+        R_ = gui_data['r_weight']
+        v_max = gui_data['v_max']
+        w_max = gui_data['w_max']
+
+        # Update bounds sesuai slider
+        lbx = [-1e9] * (self.n_x * (self.N + 1))
+        ubx = [ 1e9] * (self.n_x * (self.N + 1))
+        for _ in range(self.N):
+            lbx += [0.0,   -w_max]
+            ubx += [v_max,  w_max]
+
+        p_val = np.array([Q_, R_] + state_now + ref_state, dtype=float)
+
+        # Initial guess: state tile + u_prev tile
+        X0 = np.tile(state_now, self.N + 1)
+        U0 = np.tile(self.u_prev, self.N)
+        x0 = np.concatenate([X0, U0])
+
+        try:
+            sol   = self.solver(x0=x0, lbx=lbx, ubx=ubx,
+                                lbg=self.lbg, ubg=self.ubg, p=p_val)
+            sol_x = sol['x'].full().flatten()
+            U_sol = sol_x[self.n_x * (self.N + 1):].reshape(self.N, self.n_u)
+            v_opt = float(np.clip(U_sol[0, 0], 0.0,   v_max))
+            w_opt = float(np.clip(U_sol[0, 1], -w_max, w_max))
+            self.u_prev = [v_opt, w_opt]
+            return v_opt, w_opt
+        except Exception as e:
+            print(f"[MPC] solver gagal: {e}")
+            # Fallback sederhana jika solver gagal
+            return self._fallback(state_now, ref_state)
+
+    def _fallback(self, state_now, ref_state):
+        rx, ry, rth = state_now
+        tx, ty, _   = ref_state
+        dx, dy = tx - rx, ty - ry
+        dist   = math.hypot(dx, dy)
+        yaw_e  = math.atan2(math.sin(math.atan2(dy, dx) - rth),
+                            math.cos(math.atan2(dy, dx) - rth))
+        v = min(gui_data['v_max'], 0.6 * dist)
+        w = max(W_MIN, min(W_MAX, 1.2 * yaw_e))
+        return v, w
+
+class FallbackMPC:
+    def solve(self, state_now, ref_state):
+        rx, ry, rth = state_now
+        tx, ty, _   = ref_state
+        dx, dy = tx - rx, ty - ry
+        dist   = math.hypot(dx, dy)
+        yaw_e  = math.atan2(math.sin(math.atan2(dy, dx) - rth),
+                            math.cos(math.atan2(dy, dx) - rth))
+        v = min(gui_data['v_max'], 0.6 * dist)
+        w = max(W_MIN, min(W_MAX, 1.2 * yaw_e))
+        if dist < gui_data['safe_distance'] * 0.5:
+            v = 0.0
+        return v, w
+
+class HumanAgent:
+    def __init__(self):
+        self.body_id = None
+        self.leg_l = self.leg_r = None
+        self.vx = self.vy = 0.0
+        self.heading = 0.0
+        self.change_timer = 0
+        self.walk_phase = 0.0
+        self._spawn()
+
+    def _spawn(self):
+        x = random.uniform(-ARENA_SIZE * 0.4, ARENA_SIZE * 0.4)
+        y = random.uniform(-ARENA_SIZE * 0.4, ARENA_SIZE * 0.4)
+        torso_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.15, 0.1, 0.25])
+        torso_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.15, 0.1, 0.25], rgbaColor=[0.2, 0.5, 1.0, 1.0])
+        head_col  = p.createCollisionShape(p.GEOM_SPHERE, radius=0.12)
+        head_vis  = p.createVisualShape(p.GEOM_SPHERE, radius=0.12, rgbaColor=[1.0, 0.85, 0.7, 1.0])
+        leg_col   = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.06, 0.06, 0.2])
+        leg_vis_l = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.06, 0.06, 0.2], rgbaColor=[0.1, 0.1, 0.6, 1.0])
+        leg_vis_r = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.06, 0.06, 0.2], rgbaColor=[0.1, 0.1, 0.6, 1.0])
+        self.body_id = p.createMultiBody(
+            baseMass=60,
+            baseCollisionShapeIndex=torso_col,
+            baseVisualShapeIndex=torso_vis,
+            basePosition=[x, y, 1.05],
+            linkMasses=[0.5, 0.5, 0.5],
+            linkCollisionShapeIndices=[head_col, leg_col, leg_col],
+            linkVisualShapeIndices=[head_vis, leg_vis_l, leg_vis_r],
+            linkPositions=[[0, 0, 0.37], [-0.08, 0, -0.45], [0.08, 0, -0.45]],
+            linkOrientations=[[0,0,0,1]] * 3,
+            linkInertialFramePositions=[[0,0,0]] * 3,
+            linkInertialFrameOrientations=[[0,0,0,1]] * 3,
+            linkParentIndices=[0, 0, 0],
+            linkJointTypes=[p.JOINT_FIXED, p.JOINT_REVOLUTE, p.JOINT_REVOLUTE],
+            linkJointAxis=[[0,0,0], [1,0,0], [1,0,0]],
+        )
+        p.changeDynamics(self.body_id, -1, linearDamping=0.9, angularDamping=0.9)
+        self.leg_l, self.leg_r = 1, 2
+        self.heading = random.uniform(0, 2 * math.pi)
+        speed = gui_data['human_speed']
+        self.vx = speed * math.cos(self.heading)
+        self.vy = speed * math.sin(self.heading)
+
+    def update(self):
+        self.change_timer += 1
+        if self.change_timer > 80:
+            self.heading += random.uniform(-math.pi * 0.6, math.pi * 0.6)
+            speed = gui_data['human_speed']
+            self.vx = speed * math.cos(self.heading)
+            self.vy = speed * math.sin(self.heading)
+            self.change_timer = 0
+        pos, _ = p.getBasePositionAndOrientation(self.body_id)
+        x, y = pos[0], pos[1]
+        if abs(x + self.vx * DT) > ARENA_SIZE:
+            self.heading = math.pi - self.heading
+            self.vx *= -1
+        if abs(y + self.vy * DT) > ARENA_SIZE:
+            self.heading = -self.heading
+            self.vy *= -1
+        target_orn = p.getQuaternionFromEuler([0, 0, self.heading - math.pi / 2])
+        p.resetBasePositionAndOrientation(self.body_id, [x, y, 1.05], target_orn)
+        p.resetBaseVelocity(self.body_id, [self.vx, self.vy, 0], [0, 0, 0])
+        speed = math.hypot(self.vx, self.vy)
+        self.walk_phase += speed * DT * 3.5
+        leg_swing = math.sin(self.walk_phase) * 0.5
+        p.setJointMotorControl2(self.body_id, self.leg_l, p.POSITION_CONTROL, targetPosition= leg_swing, force=50)
+        p.setJointMotorControl2(self.body_id, self.leg_r, p.POSITION_CONTROL, targetPosition=-leg_swing, force=50)
+
+    def get_position(self):
+        pos, _ = p.getBasePositionAndOrientation(self.body_id)
+        return pos
+
+    def remove(self):
+        p.removeBody(self.body_id)
+
+def find_wheel_joints(robot):
+    left, right = [], []
+    for i in range(p.getNumJoints(robot)):
+        name = p.getJointInfo(robot, i)[1].decode().lower()
+        if 'left'  in name and 'wheel' in name: left.append(i)
+        if 'right' in name and 'wheel' in name: right.append(i)
+    return left, right
+
+def set_wheel_velocity(robot, left, right, v, w):
+    vl = (v - w * HALF_WHEELBASE) / WHEEL_RADIUS
+    vr = (v + w * HALF_WHEELBASE) / WHEEL_RADIUS
+    for j in left:
+        p.setJointMotorControl2(robot, j, p.VELOCITY_CONTROL, targetVelocity=vl, force=500)
+    for j in right:
+        p.setJointMotorControl2(robot, j, p.VELOCITY_CONTROL, targetVelocity=vr, force=500)
+
+def run_simulation(gui_ref):
+    mpc = MPCController() if CASADI_AVAILABLE else FallbackMPC()
+    p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.setGravity(0, 0, -9.81)
+    p.setTimeStep(DT)
+    p.resetDebugVisualizerCamera(cameraDistance=7, cameraYaw=0, cameraPitch=-50, cameraTargetPosition=[0, 0, 0])
+    p.loadURDF("plane.urdf")
+    try:
+        robot = p.loadURDF(ROBOT_PATH, [0, 0, 0.1])
+    except Exception:
+        robot = p.loadURDF("r2d2.urdf", [0, 0, 0.1])
+    for j in range(p.getNumJoints(robot)):
+        p.setJointMotorControl2(robot, j, p.VELOCITY_CONTROL, force=0)
+    left_joints, right_joints = find_wheel_joints(robot)
+    human = HumanAgent()
+    step_count = 0
+
+    for step in range(SIM_TIME):
+        while gui_data['paused'] and gui_ref.running:
+            time.sleep(0.05)
+        if not gui_ref.running:
+            break
+        if gui_data['reset_signal']:
+            gui_data['reset_signal'] = False
+            p.resetBasePositionAndOrientation(robot, [0, 0, 0.1], [0, 0, 0, 1])
+            human.remove()
+            human = HumanAgent()
+            step_count = 0
+            continue
+
+        human.update()
+
+        robot_pos, robot_orn = p.getBasePositionAndOrientation(robot)
+        human_pos = human.get_position()
+        yaw = p.getEulerFromQuaternion(robot_orn)[2]
+        state_now = [robot_pos[0], robot_pos[1], yaw]
+
+        distance, bearing_error, ref_state = pose_estimation(robot_pos, robot_orn, human_pos)
+
+        if distance < gui_data['safe_distance'] * 0.6:
+            v_opt, w_opt = 0.0, 0.0
+        else:
+            v_opt, w_opt = mpc.solve(state_now, ref_state)
+
+        v_opt = float(np.clip(v_opt, 0.0,   gui_data['v_max']))
+        w_opt = float(np.clip(w_opt, -gui_data['w_max'], gui_data['w_max']))
+
+        set_wheel_velocity(robot, left_joints, right_joints, v_opt, w_opt)
+
+        gui_data.update({
+            'robot_x': robot_pos[0], 'robot_y': robot_pos[1], 'robot_theta': yaw,
+            'human_x': human_pos[0], 'human_y': human_pos[1],
+            'distance': distance, 'bearing_error': bearing_error,
+            'pos_error': math.hypot(ref_state[0] - robot_pos[0], ref_state[1] - robot_pos[1]),
+            'linear_v': v_opt, 'angular_w': w_opt, 'step': step_count,
+        })
+        step_count += 1
+        p.stepSimulation()
+        time.sleep(DT / gui_data['sim_speed'])
+
+    p.disconnect()
+
+class RobotGUI:
+    def __init__(self, root):
+        self.root    = root
+        self.running = True
+        self.paused  = False
+        self.root.title("MPC Human Following DDMR")
+        self.root.geometry("500x980")
+        self.root.configure(bg='#0d0d0d')
+        self.root.resizable(False, True)
+        self._build_gui()
+        self._update_loop()
+
+    def _build_gui(self):
+        hdr = tk.Frame(self.root, bg='#003d2b', height=80)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="MPC HUMAN FOLLOWING", font=('Courier', 15, 'bold'), bg='#003d2b', fg='#00ff99').pack(pady=4)
+        tk.Label(hdr, text="Pose-Estimation  .  DDMR  .  Model Predictive Control", font=('Courier', 8), bg='#003d2b', fg='#55aa77').pack()
+        tk.Label(hdr, text=f"MODE: {gui_data['mpc_mode']}", font=('Courier', 8, 'bold'), bg='#003d2b', fg='#ffcc00').pack(pady=2)
+        cf = self._section("SIMULATION CONTROL")
+        btn_row = tk.Frame(cf, bg='#141414')
+        btn_row.pack(pady=8)
+        self.pause_btn = self._btn(btn_row, "PAUSE",  '#e67e00', self._toggle_pause, 0, 0)
+        self._btn(btn_row, "RESET", '#1565C0', self._reset, 0, 1)
+        self._slider(cf, "Sim Speed", 0.1, 4.0, 0.1, 1.0, 'sim_speed')
+        pf = self._section("POSE-ESTIMATION  (Kinect Sim)")
+        self.lbl_rx  = self._metric(pf, "Robot X",       "0.000 m",   '#00e5ff')
+        self.lbl_ry  = self._metric(pf, "Robot Y",       "0.000 m",   '#00e5ff')
+        self.lbl_rth = self._metric(pf, "Robot theta",   "0.000 rad", '#00e5ff')
+        self.lbl_hx  = self._metric(pf, "Human X",       "0.000 m",   '#ff6ec7')
+        self.lbl_hy  = self._metric(pf, "Human Y",       "0.000 m",   '#ff6ec7')
+        ef = self._section("ERROR  (e_k)")
+        self.lbl_dist = self._metric(ef, "Distance",      "0.000 m",   '#ffdd57')
+        self.lbl_bear = self._metric(ef, "Bearing Error", "0.000 rad", '#ff7043')
+        self.lbl_perr = self._metric(ef, "Pos Error",     "0.000 m",   '#ff7043')
+        mf = self._section("MPC OUTPUT  (u_k)")
+        self.lbl_v = self._metric(mf, "Linear  v", "0.000 m/s",  '#69f0ae')
+        self.lbl_w = self._metric(mf, "Angular w", "0.000 rad/s",'#40c4ff')
+        prmf = self._section("MPC PARAMETERS")
+        self._slider(prmf, "Safe Distance (m)", 0.3, 2.0,  0.1,  SAFE_DISTANCE, 'safe_distance')
+        self._slider(prmf, "v_max (m/s)",       0.1, 1.0,  0.05, V_MAX,         'v_max')
+        self._slider(prmf, "w_max (rad/s)",     0.3, 3.0,  0.1,  W_MAX,         'w_max')
+        self._slider(prmf, "Q weight",          1.0, 30.0, 1.0,  Q_WEIGHT,      'q_weight')
+        self._slider(prmf, "R weight",          0.1, 5.0,  0.1,  R_WEIGHT,      'r_weight')
+        self._slider(prmf, "Human Speed (m/s)", 0.1, 1.0,  0.05, HUMAN_SPEED,   'human_speed')
+        sf = self._section("STATISTICS")
+        self.lbl_step = self._metric(sf, "Step", "0", '#b0bec5')
+
+    def _section(self, title):
+        f = tk.LabelFrame(self.root, text=title, font=('Courier', 9, 'bold'),
+                          bg='#141414', fg='#00ff99', relief=tk.GROOVE, bd=2)
+        f.pack(padx=12, pady=6, fill=tk.X)
+        return f
+
+    def _btn(self, parent, text, color, cmd, row, col):
+        b = tk.Button(parent, text=text, command=cmd, font=('Courier', 9, 'bold'),
+                      bg=color, fg='white', width=13, height=2, cursor='hand2', relief=tk.RAISED, bd=2)
+        b.grid(row=row, column=col, padx=6, pady=4)
+        return b
+
+    def _metric(self, parent, label, value, color):
+        frm = tk.Frame(parent, bg='#141414')
+        frm.pack(fill=tk.X, padx=14, pady=4)
+        tk.Label(frm, text=label + " :", font=('Courier', 9), bg='#141414', fg='#aaaaaa', anchor='w').pack(side=tk.LEFT)
+        lbl = tk.Label(frm, text=value, font=('Courier', 9, 'bold'), bg='#141414', fg=color, anchor='e')
+        lbl.pack(side=tk.RIGHT)
+        return lbl
+
+    def _slider(self, parent, label, from_, to, res, init, key):
+        frm = tk.Frame(parent, bg='#141414')
+        frm.pack(fill=tk.X, padx=14, pady=3)
+        tk.Label(frm, text=label, font=('Courier', 8), bg='#141414', fg='#cccccc').pack(anchor='w')
+        sl = tk.Scale(frm, from_=from_, to=to, resolution=res, orient=tk.HORIZONTAL,
+                      command=lambda v, k=key: gui_data.update({k: float(v)}),
+                      bg='#141414', fg='#ffffff', font=('Courier', 8),
+                      highlightthickness=0, troughcolor='#0d0d0d', activebackground='#00ff99')
+        sl.set(init)
+        sl.pack(fill=tk.X)
+
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        gui_data['paused'] = self.paused
+        self.pause_btn.config(text="RESUME" if self.paused else "PAUSE",
+                              bg='#2e7d32' if self.paused else '#e67e00')
+
+    def _reset(self):
+        gui_data['reset_signal'] = True
+
+    def _update_loop(self):
+        if not self.running:
+            return
+        self.lbl_rx.config(text=f"{gui_data['robot_x']:.3f} m")
+        self.lbl_ry.config(text=f"{gui_data['robot_y']:.3f} m")
+        self.lbl_rth.config(text=f"{gui_data['robot_theta']:.3f} rad")
+        self.lbl_hx.config(text=f"{gui_data['human_x']:.3f} m")
+        self.lbl_hy.config(text=f"{gui_data['human_y']:.3f} m")
+        dist = gui_data['distance']
+        dc = '#69f0ae' if dist < 1.2 else '#ffdd57' if dist < 2.5 else '#ff5252'
+        self.lbl_dist.config(text=f"{dist:.3f} m", fg=dc)
+        self.lbl_bear.config(text=f"{gui_data['bearing_error']:.3f} rad")
+        self.lbl_perr.config(text=f"{gui_data['pos_error']:.3f} m")
+        v = gui_data['linear_v']
+        vc = '#69f0ae' if abs(v) < 0.2 else '#ffdd57' if abs(v) < 0.4 else '#ff5252'
+        self.lbl_v.config(text=f"{v:.3f} m/s", fg=vc)
+        self.lbl_w.config(text=f"{gui_data['angular_w']:.3f} rad/s")
+        self.lbl_step.config(text=str(gui_data['step']))
+        self.root.after(60, self._update_loop)
+
+    def cleanup(self):
+        self.running = False
+
+def main():
+    root = tk.Tk()
+    gui  = RobotGUI(root)
+    sim_thread = threading.Thread(target=run_simulation, args=(gui,), daemon=True)
+    sim_thread.start()
+    def on_closing():
+        gui.cleanup()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
