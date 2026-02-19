@@ -9,10 +9,7 @@
 - [Overview](#overview)
 - [System Architecture](#system-architecture)
 - [Mathematical Equations](#mathematical-equations)
-- [Installation](#installation)
-- [How to Run](#how-to-run)
 - [GUI Controls](#gui-controls)
-- [Project Structure](#project-structure)
 
 ---
 
