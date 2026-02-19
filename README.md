@@ -138,8 +138,8 @@ $$v_{left} = \frac{v - \omega \cdot L}{R}$$
 $$v_{right} = \frac{v + \omega \cdot L}{R}$$
 
 Where:
-- $L = 0.16$ m — half wheelbase (TurtleBot3)
-- $R = 0.033$ m — wheel radius (TurtleBot3)
+- $L = 0.16$ m — half wheelbase (TurtleBot 2)
+- $R = 0.033$ m — wheel radius (TurtleBot 2)
 
 ---
 
