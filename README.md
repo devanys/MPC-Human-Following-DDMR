@@ -1,6 +1,11 @@
 # Pose-Estimation Human Following DDMR Mobile Robot
 ## using Model Predictive Control (MPC)
 
+
+
+https://github.com/user-attachments/assets/efcd1614-b46d-4087-8be6-171c0b0c5b4e
+
+
 > Simulation of a Differential Drive Mobile Robot (DDMR) that follows a human using Model Predictive Control (MPC) and Pose-Estimation — built with PyBullet and Python.
 
 ---
