@@ -162,7 +162,7 @@ Where:
 
 ## References
 
-- Differential Drive Robot Kinematics
-- Model Predictive Control — Rawlings & Mayne
-- CasADi: A software framework for nonlinear optimization
-- PyBullet Documentation
+- Sudianto, A. I., Muslim, M. A., & Rusli, M. (2023). Sensor fusion using model predictive control for differential dual wheeled robot. Kinetik: Game Technology, Information System, Computer Network, Computing, Electronics, and Control, 8(1), 27-88. ISSN: 2503-2267. Retrieved from http://kinetik.umm.ac.id
+- Eirale, A., Martini, M., & Chiaberge, M. (2025). Human following and guidance by autonomous mobile robots: A comprehensive review. IEEE Access, 13. https://doi.org/10.1109/ACCESS.2025.3548134
+- Rawlings, J. B., & Mayne, D. Q. Model Predictive Control: Theory and Design.
+- Andersson, J. A. E., et al. CasADi: A software framework for nonlinear optimization and optimal control.
