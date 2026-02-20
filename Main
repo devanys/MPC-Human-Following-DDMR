@@ -74,18 +74,14 @@ class MPCController:
         st = vertcat(x, y, th)
         ct = vertcat(v, om)
 
-        # --- Model kinematik DDMR ---
         f = Function('f', [st, ct], [vertcat(
             x  + v * cos(th) * self.dt,
             y  + v * sin(th) * self.dt,
             th + om * self.dt
         )])
 
-        # --- Decision variables ---
         X = SX.sym('X', self.n_x, self.N + 1)
         U = SX.sym('U', self.n_u, self.N)
-
-        # --- Parameter: [Q, R, state_awal(3), ref_state(3)] ---
         P = SX.sym('P', 2 + self.n_x + self.n_x)
 
         Q_sym = P[0]
@@ -96,7 +92,6 @@ class MPCController:
         cost = 0
         g    = []
 
-        # Constraint: state awal harus sama dengan state robot sekarang
         g.append(X[:, 0] - x0_p)
 
         for i in range(self.N):
@@ -108,21 +103,16 @@ class MPCController:
                 du = U[:, i]
             cost += R_sym * (du[0]**2 + du[1]**2)
             g.append(X[:, i+1] - f(X[:, i], U[:, i]))
-
-        # Terminal cost
         e_t   = X[:, self.N] - xref
         cost += Q_sym * (e_t[0]**2 + e_t[1]**2)
 
         opt_vars = vertcat(reshape(X, -1, 1), reshape(U, -1, 1))
         nlp = {'x': opt_vars, 'f': cost, 'g': vertcat(*g), 'p': P}
 
-        # Constraints bounds
-        # g[0]: state awal (3 equality) + model (n_x * N equality)
         n_eq = self.n_x + self.n_x * self.N
         self.lbg = [0.0] * n_eq
         self.ubg = [0.0] * n_eq
 
-        # Variable bounds
         lbx = [-1e9] * (self.n_x * (self.N + 1))
         ubx = [ 1e9] * (self.n_x * (self.N + 1))
         for _ in range(self.N):
