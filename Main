@@ -28,7 +28,7 @@ SAFE_DISTANCE  = 0.8
 ARENA_SIZE     = 4.0
 HUMAN_SPEED    = 0.4
 
-ROBOT_PATH = "C:/Users/Devan/Downloads/pybullet_robots-master/pybullet_robots-master/data/turtlebot.urdf"
+ROBOT_PATH = "turtlebot.urdf"
 
 gui_data = {
     'robot_x': 0.0, 'robot_y': 0.0, 'robot_theta': 0.0,
